@@ -1,0 +1,99 @@
+import os
+configfile: "config.yaml"
+SAMPLES = list(config["samples"].keys())
+REF = config["reference"]
+THREADS = config["threads"]
+OUT = config["outdir"]
+
+rule all:
+    input:
+        expand(f"{OUT}/{{sample}}.final_report.pdf", sample=SAMPLES)
+
+rule bwa_mem:
+    input:
+        fq = lambda wildcards: config["samples"][wildcards.sample]
+    output:
+        bam = temp(f"{OUT}/{wildcards.sample}.aligned.bam")
+    threads: THREADS
+    shell:
+        """
+        {config[bwa]} mem -t {threads} {REF} {input.fq} | \
+          {config[samtools]} view -b - > {output.bam}
+        """
+
+rule sort_markdup:
+    input:
+        bam = rules.bwa_mem.output.bam
+    output:
+        bam = temp(f"{OUT}/{wildcards.sample}.dedup.bam"),
+        metrics = f"{OUT}/{wildcards.sample}.dup_metrics.txt"
+    threads: THREADS
+    shell:
+        """
+        {config[samtools]} sort -@ {threads} -o - {input.bam} | \
+        {config[gatk]} MarkDuplicates \
+          I=/dev/stdin O={output.bam} \
+          M={output.metrics} CREATE_INDEX=true VALIDATION_STRINGENCY=SILENT
+        """
+
+rule haplotypecaller:
+    input:
+        bam = rules.sort_markdup.output.bam,
+        fai = REF + ".fai"
+    output:
+        vcf = temp(f"{OUT}/{wildcards.sample}.raw.vcf.gz")
+    threads: THREADS
+    shell:
+        """
+        {config[gatk]} HaplotypeCaller \
+          -R {REF} -I {input.bam} \
+          -O {output.vcf} \
+          -L {config[intervals]} \
+          --native-pair-hmm-threads {threads}
+        """
+
+rule annotate:
+    input:
+        vcf = rules.haplotypecaller.output.vcf
+    output:
+        vcf = f"{OUT}/{wildcards.sample}.annotated.vcf"
+    shell:
+        """
+        java -Xmx4g -jar {config[snpeff_jar]} \
+          -t {config[snp_effect_db]} \
+          {input.vcf} > {output.vcf}
+        """
+
+rule risk_scoring:
+    input:
+        vcf = rules.annotate.output.vcf
+    output:
+        json = f"{OUT}/{wildcards.sample}.risk_scores.json"
+    params:
+        models = config["models"]
+    conda:
+        "envs/risk.yaml"
+    shell:
+        """
+        python scripts/risk_score.py \
+          --vcf {input.vcf} \
+          --models {params.models} \
+          --out {output.json}
+        """
+
+rule generate_report:
+    input:
+        risk = rules.risk_scoring.output.json,
+        vcf = rules.annotate.output.vcf
+    output:
+        pdf = f"{OUT}/{wildcards.sample}.final_report.pdf"
+    conda:
+        "envs/report.yaml"
+    shell:
+        """
+        python scripts/generate_report.py \
+          --risk {input.risk} \
+          --vcf {input.vcf} \
+          --template scripts/report_template.tex.j2 \
+          --out {output.pdf}
+        """
